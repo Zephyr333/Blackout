@@ -1,0 +1,5 @@
+C:\Users\asus\OneDrive\Code\C#\C# Learning\Blackout\Blackout\obj\Debug\net8.0\Blackout.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\asus\OneDrive\Code\C#\C# Learning\Blackout\Blackout\obj\Debug\net8.0\Blackout.AssemblyInfoInputs.cache
+C:\Users\asus\OneDrive\Code\C#\C# Learning\Blackout\Blackout\obj\Debug\net8.0\Blackout.AssemblyInfo.cs
+C:\Users\asus\OneDrive\Code\C#\C# Learning\Blackout\Blackout\obj\Debug\net8.0\Blackout.csproj.CoreCompileInputs.cache
+C:\Users\asus\OneDrive\Code\C#\C# Learning\Blackout\Blackout\obj\Debug\net8.0\Blackout.csproj.ResolveComReference.cache
