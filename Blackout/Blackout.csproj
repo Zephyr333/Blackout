@@ -1,0 +1,20 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net8.0-windows</TargetFramework>
+		<UseWindowsForms>true</UseWindowsForms>
+		<ApplicationManifest>app.manifest</ApplicationManifest>
+		<ApplicationIcon>黑屏.ico</ApplicationIcon>
+		<Platforms>AnyCPU;ARM64;x64</Platforms>
+	</PropertyGroup>
+
+	<ItemGroup>
+	  <Content Include="黑屏.ico" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="System.Management" Version="5.0.0" />
+	</ItemGroup>
+
+</Project>

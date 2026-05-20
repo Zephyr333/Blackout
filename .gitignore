@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.rsuser
+
+# Rider / JetBrains
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Publish artifacts
+*.pdb
+*.nupkg
+
+# Local executable copies
+/Blackout.exe
