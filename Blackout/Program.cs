@@ -257,7 +257,7 @@ namespace Blackout
                 exitMenuItem
             });
 
-            MigrateLegacyAutoStartConfiguration();
+            RemoveLegacyRegistryAutoStart();
             autoStartMenuItem.Checked = IsAutoStartEnabled();
 
             Application.ApplicationExit += (sender, e) =>
@@ -313,7 +313,7 @@ namespace Blackout
 
         private static bool IsAutoStartEnabled()
         {
-            return IsElevatedAutoStartTaskEnabled() && IsRegistryAutoStartEnabled();
+            return RunSchtasksCommand($"/Query /TN \"{AutoStartTaskName}\"", out _, out _);
         }
 
         private static bool SetAutoStartEnabled(bool enable, out string errorMessage)
@@ -327,8 +327,8 @@ namespace Blackout
 
             if (enable)
             {
-                if (CreateOrUpdateElevatedAutoStartTask(exePath, out errorMessage)
-                    && SetRegistryAutoStart(out errorMessage))
+                RemoveLegacyRegistryAutoStart();
+                if (CreateOrUpdateAutoStartTask(exePath, out errorMessage))
                 {
                     return true;
                 }
@@ -337,9 +337,8 @@ namespace Blackout
                 return false;
             }
 
-            bool registryRemoved = RemoveRegistryAutoStart(out errorMessage);
-            bool taskRemoved = DeleteElevatedAutoStartTask(out string taskErrorMessage);
-            if (registryRemoved && (taskRemoved || !IsElevatedAutoStartTaskEnabled()))
+            RemoveLegacyRegistryAutoStart();
+            if (RunSchtasksCommand($"/Delete /F /TN \"{AutoStartTaskName}\"", out _, out errorMessage))
             {
                 return true;
             }
@@ -350,62 +349,11 @@ namespace Blackout
                 return true;
             }
 
-            if (!registryRemoved)
-            {
-                errorMessage = "关闭开机自启失败。" + Environment.NewLine + errorMessage;
-                return false;
-            }
-
-            errorMessage = "已关闭启动应用列表中的自启，但旧版本创建的计划任务删除失败。"
-                + Environment.NewLine
-                + "请以管理员身份运行 Blackout 后再关闭一次开机自启，或在任务计划程序中删除 Blackout_AutoStart。"
-                + Environment.NewLine
-                + taskErrorMessage;
+            errorMessage = "关闭开机自启失败。" + Environment.NewLine + errorMessage;
             return false;
         }
 
-        private static bool IsRegistryAutoStartEnabled()
-        {
-            try
-            {
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, false))
-                {
-                    string value = key?.GetValue(AutoStartValueName) as string;
-                    return IsAutoStartLauncherCommand(value) && IsStartupApprovedEnabled();
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static bool SetRegistryAutoStart(out string errorMessage)
-        {
-            try
-            {
-                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RunRegistryPath))
-                {
-                    if (key == null)
-                    {
-                        errorMessage = "无法打开当前用户的启动注册表项。";
-                        return false;
-                    }
-
-                    key.SetValue(AutoStartValueName, CreateAutoStartLauncherCommand(), RegistryValueKind.String);
-                    SetStartupApprovedEnabled();
-                    errorMessage = string.Empty;
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                errorMessage = ex.Message;
-                return false;
-            }
-        }
-
-        private static bool RemoveRegistryAutoStart(out string errorMessage)
+        private static void RemoveLegacyRegistryAutoStart()
         {
             try
             {
@@ -418,182 +366,24 @@ namespace Blackout
                 {
                     key?.DeleteValue(AutoStartValueName, false);
                 }
-
-                errorMessage = string.Empty;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                errorMessage = ex.Message;
-                return false;
-            }
-        }
-
-        private static bool IsAutoStartLauncherCommand(string command)
-        {
-            if (string.IsNullOrWhiteSpace(command))
-            {
-                return false;
-            }
-
-            return command.IndexOf("schtasks.exe", StringComparison.OrdinalIgnoreCase) >= 0
-                && command.IndexOf(AutoStartTaskName, StringComparison.OrdinalIgnoreCase) >= 0;
-        }
-
-        private static bool IsStartupApprovedEnabled()
-        {
-            try
-            {
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(StartupApprovedRunRegistryPath, false))
-                {
-                    byte[] value = key?.GetValue(AutoStartValueName) as byte[];
-                    if (value == null || value.Length == 0)
-                    {
-                        return true;
-                    }
-
-                    return value[0] != 0x03;
-                }
             }
             catch
             {
-                return true;
             }
         }
 
-        private static void SetStartupApprovedEnabled()
+        private static bool CreateOrUpdateAutoStartTask(string exePath, out string errorMessage)
         {
-            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(StartupApprovedRunRegistryPath))
-            {
-                key?.SetValue(
-                    AutoStartValueName,
-                    new byte[] { 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-                    RegistryValueKind.Binary);
-            }
-        }
-
-        private static string CreateAutoStartLauncherCommand()
-        {
-            string schtasksPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "schtasks.exe");
-            return QuoteCommandPath(schtasksPath) + $" /Run /TN \"{AutoStartTaskName}\"";
-        }
-
-        private static string QuoteCommandPath(string exePath)
-        {
-            return "\"" + exePath + "\"";
-        }
-
-        private static bool IsElevatedAutoStartTaskEnabled()
-        {
-            return RunSchtasksCommand($"/Query /TN \"{AutoStartTaskName}\"", out _, out _);
-        }
-
-        private static void MigrateLegacyAutoStartConfiguration()
-        {
-            if (!IsElevatedAutoStartTaskEnabled())
-            {
-                return;
-            }
-
-            if (CreateOrUpdateElevatedAutoStartTask(Application.ExecutablePath, out _))
-            {
-                if (!IsRegistryAutoStartEnabled())
-                {
-                    SetRegistryAutoStart(out _);
-                }
-            }
-        }
-
-        private static bool CreateOrUpdateElevatedAutoStartTask(string exePath, out string errorMessage)
-        {
-            string taskXmlPath = Path.Combine(Path.GetTempPath(), AutoStartTaskName + ".xml");
-            try
-            {
-                File.WriteAllText(taskXmlPath, CreateElevatedTaskXml(exePath), System.Text.Encoding.Unicode);
-                string args = $"/Create /F /TN \"{AutoStartTaskName}\" /XML \"{taskXmlPath}\"";
-                if (RunSchtasksCommand(args, out _, out errorMessage))
-                {
-                    return true;
-                }
-
-                errorMessage = string.IsNullOrWhiteSpace(errorMessage)
-                    ? "创建最高权限计划任务失败。请确认当前 Blackout 是以管理员身份运行。"
-                    : errorMessage;
-                return false;
-            }
-            catch (Exception ex)
-            {
-                errorMessage = ex.Message;
-                return false;
-            }
-            finally
-            {
-                try
-                {
-                    File.Delete(taskXmlPath);
-                }
-                catch
-                {
-                }
-            }
-        }
-
-        private static string CreateElevatedTaskXml(string exePath)
-        {
-            string escapedExePath = System.Security.SecurityElement.Escape(exePath);
-            return $@"<?xml version=""1.0"" encoding=""UTF-16""?>
-<Task version=""1.4"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
-  <RegistrationInfo>
-    <Description>Run Blackout with highest privileges when launched from the Windows startup app entry.</Description>
-  </RegistrationInfo>
-  <Principals>
-    <Principal id=""Author"">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context=""Author"">
-    <Exec>
-      <Command>{escapedExePath}</Command>
-    </Exec>
-  </Actions>
-</Task>";
-        }
-
-        private static bool DeleteElevatedAutoStartTask(out string errorMessage)
-        {
-            errorMessage = string.Empty;
-            if (!IsElevatedAutoStartTaskEnabled())
+            string args = $"/Create /F /TN \"{AutoStartTaskName}\" /SC ONLOGON /RL HIGHEST /TR \"\\\"{exePath}\\\"\"";
+            if (RunSchtasksCommand(args, out _, out errorMessage))
             {
                 return true;
             }
 
-            bool deleted = RunSchtasksCommand($"/Delete /F /TN \"{AutoStartTaskName}\"", out string outputText, out string errorText);
-            if (!deleted)
-            {
-                errorMessage = string.IsNullOrWhiteSpace(errorText) ? outputText : errorText;
-            }
-
-            return deleted;
+            errorMessage = string.IsNullOrWhiteSpace(errorMessage)
+                ? "创建最高权限计划任务失败。请确认当前 Blackout 是以管理员身份运行。"
+                : errorMessage;
+            return false;
         }
 
         private static bool RunSchtasksCommand(string arguments, out string outputText, out string errorText)
