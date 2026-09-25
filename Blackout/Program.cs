@@ -72,9 +72,25 @@ namespace Blackout
                     Y = 0,
                     Width = 0,
                     Height = 0,
-                    Style = 0
+                    Style = unchecked((int)0x80000000), // WS_POPUP (top-level window so SetForegroundWindow succeeds for native menu)
+                    ExStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
                 };
                 CreateHandle(cp);
+
+                // 允许低权限进程跨 UIPI 发送托盘唤醒消息
+                if (_wmBlackoutShowTray != 0)
+                {
+                    ChangeWindowMessageFilterEx(Handle, _wmBlackoutShowTray, MSGFLT_ALLOW, IntPtr.Zero);
+                }
+                if (_wmTaskbarCreated != 0)
+                {
+                    ChangeWindowMessageFilterEx(Handle, _wmTaskbarCreated, MSGFLT_ALLOW, IntPtr.Zero);
+                }
+                if (_wmBlackoutQuit != 0)
+                {
+                    ChangeWindowMessageFilterEx(Handle, _wmBlackoutQuit, MSGFLT_ALLOW, IntPtr.Zero);
+                }
+                ChangeWindowMessageFilterEx(Handle, 0x0010 /* WM_CLOSE */, MSGFLT_ALLOW, IntPtr.Zero);
             }
 
             protected override void WndProc(ref Message m)
@@ -87,21 +103,53 @@ namespace Blackout
                 {
                     RebuildNotifyIcon();
                 }
+                else if ((_wmBlackoutQuit != 0 && m.Msg == _wmBlackoutQuit) || m.Msg == 0x0010 /* WM_CLOSE */)
+                {
+                    ExitApplication();
+                    return;
+                }
                 base.WndProc(ref m);
             }
         }
 
         // 通知图标与托盘守护窗口
         private static NotifyIcon notifyIcon;
-        private static ContextMenuStrip contextMenu;
         private static TrayMessageWindow trayMessageWindow;
         private static System.Windows.Forms.Timer trayHealthTimer;
         private static int trayStartupCheckCount;
         private static Cursor blankCursor;
+        private static bool _isMenuOpen;
 
         private static Mutex singleInstanceMutex;
         private static uint _wmTaskbarCreated;
         private static uint _wmBlackoutShowTray;
+        private static uint _wmBlackoutQuit;
+
+        // 原生托盘菜单命令 ID
+        private const int ID_MENU_BLACKOUT_ALL = 1001;
+        private const int ID_MENU_BLACKOUT_MAIN = 1002;
+        private const int ID_MENU_BLACKOUT_SUB = 1003;
+        private const int ID_MENU_AUTOSTART = 1004;
+        private const int ID_MENU_RESTART = 1005;
+        private const int ID_MENU_EXIT = 1006;
+        private const int ID_MENU_SCREEN_BASE = 2000;
+
+        // Win32 原生菜单标志
+        private const uint MF_STRING = 0x00000000;
+        private const uint MF_POPUP = 0x00000010;
+        private const uint MF_SEPARATOR = 0x00000800;
+        private const uint MF_CHECKED = 0x00000008;
+        private const uint MF_GRAYED = 0x00000001;
+
+        private const uint TPM_LEFTALIGN = 0x0000;
+        private const uint TPM_BOTTOMALIGN = 0x0020;
+        private const uint TPM_RIGHTBUTTON = 0x0002;
+        private const uint TPM_RETURNCMD = 0x0100;
+        private const uint WM_NULL = 0x0000;
+
+        private const uint SPI_GETMENUDROPALIGNMENT = 0x001B;
+        private const uint SPI_SETMENUDROPALIGNMENT = 0x001C;
+        private const uint MSGFLT_ALLOW = 1;
 
         // 存储当前所有黑屏窗口与已黑屏显示器句柄
         private static readonly List<BlackoutOverlayForm> windows = new List<BlackoutOverlayForm>();
@@ -164,6 +212,7 @@ namespace Blackout
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_TOPMOST = 0x00000008;
         private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
 
         // Win32 P/Invoke
         [DllImport("user32.dll", SetLastError = true)]
@@ -188,6 +237,9 @@ namespace Blackout
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
 
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
@@ -201,13 +253,37 @@ namespace Blackout
         private static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll")]
+        private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint msg, uint action, IntPtr pChangeFilterStruct);
+
+        [DllImport("user32.dll")]
         private static extern bool IsWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        private static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight, byte[] pvANDPlane, byte[] pvXORPlane);
+        private static extern IntPtr CreatePopupMenu();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool AppendMenuW(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, string lpNewItem);
 
         [DllImport("user32.dll")]
-        private static extern bool DestroyCursor(IntPtr hCursor);
+        private static extern int TrackPopupMenuEx(IntPtr hmenu, uint fuFlags, int x, int y, IntPtr hwnd, IntPtr lptpm);
+
+        [DllImport("user32.dll")]
+        private static extern bool DestroyMenu(IntPtr hMenu);
+
+        [DllImport("user32.dll")]
+        private static extern bool SystemParametersInfoW(uint uiAction, uint uiParam, ref int pvParam, uint fWinIni);
+
+        [DllImport("user32.dll")]
+        private static extern bool SystemParametersInfoW(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+
+        [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
+        private static extern int SetPreferredAppMode(int preferredAppMode);
+
+        [DllImport("uxtheme.dll", EntryPoint = "#136", SetLastError = true)]
+        private static extern void FlushMenuThemes();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CreateCursor(IntPtr hInst, int xHotSpot, int yHotSpot, int nWidth, int nHeight, byte[] pvANDPlane, byte[] pvXORPlane);
 
         [DllImport("dxva2.dll", SetLastError = true)]
         private static extern bool GetMonitorBrightness(IntPtr hMonitor, out int pdwMinimumBrightness, out int pdwCurrentBrightness, out int pdwMaximumBrightness);
@@ -304,10 +380,6 @@ namespace Blackout
 
         private static SynchronizationContext syncContext;
 
-        private static ToolStripMenuItem blackoutMainScreenMenuItem;
-        private static ToolStripMenuItem blackoutOtherScreensMenuItem;
-        private static ToolStripMenuItem autoStartMenuItem;
-
         private const string AutoStartTaskName = "Blackout_AutoStart";
         private const string AutoStartValueName = "Blackout";
         private const string RunRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -320,23 +392,43 @@ namespace Blackout
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            Application.ThreadException += (s, e) => { /* 捕获 UI 线程非致命异常，防止托盘闪退 */ };
-            AppDomain.CurrentDomain.UnhandledException += (s, e) => { /* 防止驱动/WMI 瞬断异常杀进程 */ };
+            Application.ThreadException += (s, e) => { };
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => { };
+
+            ApplyNativeMenuTheme();
 
             _wmTaskbarCreated = RegisterWindowMessageW("TaskbarCreated");
             _wmBlackoutShowTray = RegisterWindowMessageW("Blackout_ShowTray_Msg");
+            _wmBlackoutQuit = RegisterWindowMessageW("Blackout_Quit_Msg");
 
             singleInstanceMutex = new Mutex(true, @"Local\Blackout_SingleInstance", out bool createdNew);
             if (!createdNew)
             {
-                // 唤醒后台实例重挂托盘图标；若后台实例无响应卡死，则终止旧实例并接管
+                IntPtr oldTrayWnd = FindWindowW(null, "Blackout_TrayMessageWindow");
+                if (oldTrayWnd != IntPtr.Zero)
+                {
+                    if (_wmBlackoutQuit != 0)
+                    {
+                        PostMessageW(oldTrayWnd, _wmBlackoutQuit, IntPtr.Zero, IntPtr.Zero);
+                    }
+                    PostMessageW(oldTrayWnd, 0x0010 /* WM_CLOSE */, IntPtr.Zero, IntPtr.Zero);
+                }
                 if (_wmBlackoutShowTray != 0)
                 {
                     PostMessageW(HWND_BROADCAST, _wmBlackoutShowTray, IntPtr.Zero, IntPtr.Zero);
                 }
 
-                bool tookOver = TryTakeOverUnresponsiveInstance();
-                if (!tookOver)
+                bool acquired = false;
+                try
+                {
+                    acquired = singleInstanceMutex.WaitOne(1500);
+                }
+                catch (AbandonedMutexException)
+                {
+                    acquired = true;
+                }
+
+                if (!acquired && !TryTakeOverUnresponsiveInstance())
                 {
                     return;
                 }
@@ -344,7 +436,6 @@ namespace Blackout
 
             _currentProcessId = (uint)Process.GetCurrentProcess().Id;
 
-            // 开机登录阶段等待 explorer.exe 系统托盘窗口就绪（最多等待 12 秒）
             WaitForShellTrayReady(maxWaitMs: 12000);
 
             syncContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
@@ -353,26 +444,6 @@ namespace Blackout
             blankCursor = CreateBlankCursor();
             trayMessageWindow = new TrayMessageWindow();
 
-            // 创建上下文菜单
-            contextMenu = new ContextMenuStrip();
-            ToolStripMenuItem blackoutMenuItem = new ToolStripMenuItem("一键黑屏", null, BlackoutMenuItem_Click);
-            blackoutMainScreenMenuItem = new ToolStripMenuItem("主屏黑屏", null, BlackoutMainScreenMenuItem_Click);
-            blackoutOtherScreensMenuItem = new ToolStripMenuItem("副屏黑屏", null, BlackoutOtherScreensMenuItem_Click);
-            autoStartMenuItem = new ToolStripMenuItem("开机自启", null, AutoStartMenuItem_Click);
-            ToolStripMenuItem restartMenuItem = new ToolStripMenuItem("重启软件", null, RestartMenuItem_Click);
-            ToolStripMenuItem exitMenuItem = new ToolStripMenuItem("退出软件", null, ExitMenuItem_Click);
-
-            contextMenu.Items.AddRange(new ToolStripItem[]
-            {
-                blackoutMenuItem,
-                blackoutMainScreenMenuItem,
-                blackoutOtherScreensMenuItem,
-                autoStartMenuItem,
-                restartMenuItem,
-                exitMenuItem
-            });
-            contextMenu.Opening += ContextMenu_Opening;
-
             InitializeNotifyIcon();
 
             RemoveLegacyRegistryAutoStart();
@@ -380,10 +451,7 @@ namespace Blackout
             {
                 CreateOrUpdateAutoStartTask(Application.ExecutablePath, out _);
             }
-            bool autoStartEnabled = IsAutoStartEnabled();
-            autoStartMenuItem.Checked = autoStartEnabled;
 
-            // 启动前 30 秒内周期性确认托盘可见性，防止登录初期资源管理器延迟吞图标
             trayStartupCheckCount = 0;
             trayHealthTimer = new System.Windows.Forms.Timer { Interval = 3000 };
             trayHealthTimer.Tick += (s, e) =>
@@ -408,6 +476,18 @@ namespace Blackout
             Application.Run();
         }
 
+        private static void ApplyNativeMenuTheme()
+        {
+            try
+            {
+                SetPreferredAppMode(1); // AllowDark: 跟随 Windows 10/11 深色/浅色系统主题
+                FlushMenuThemes();
+            }
+            catch
+            {
+            }
+        }
+
         private static bool TryTakeOverUnresponsiveInstance()
         {
             try
@@ -421,17 +501,14 @@ namespace Blackout
                     using (p)
                     {
                         if (p.Id == currentId) continue;
-                        if (!p.Responding)
+                        try
                         {
-                            try
-                            {
-                                p.Kill();
-                                p.WaitForExit(2000);
-                                killedAny = true;
-                            }
-                            catch
-                            {
-                            }
+                            p.Kill();
+                            p.WaitForExit(2000);
+                            killedAny = true;
+                        }
+                        catch
+                        {
                         }
                     }
                 }
@@ -484,10 +561,9 @@ namespace Blackout
             {
                 Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application,
                 Text = "Blackout",
-                ContextMenuStrip = contextMenu,
                 Visible = true
             };
-            notifyIcon.MouseClick += NotifyIcon_MouseClick;
+            notifyIcon.MouseUp += NotifyIcon_MouseUp;
         }
 
         private static void RebuildNotifyIcon()
@@ -507,6 +583,160 @@ namespace Blackout
             catch
             {
                 InitializeNotifyIcon();
+            }
+        }
+
+        private static void NotifyIcon_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                if (windows.Count > 0)
+                {
+                    CloseAllWindows();
+                }
+                else
+                {
+                    EnterBlackoutMode();
+                }
+            }
+            else if (e.Button == MouseButtons.Right)
+            {
+                if (windows.Count > 0)
+                {
+                    CloseAllWindows();
+                    return;
+                }
+
+                ShowNativeTrayMenu();
+            }
+        }
+
+        private static void ShowNativeTrayMenu()
+        {
+            if (_isMenuOpen || trayMessageWindow == null || trayMessageWindow.Handle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            _isMenuOpen = true;
+            IntPtr hMenu = IntPtr.Zero;
+            IntPtr hScreenSubMenu = IntPtr.Zero;
+            int prevDropAlignment = 0;
+            bool restoredAlignment = false;
+
+            try
+            {
+                ApplyNativeMenuTheme();
+
+                enumeratedMonitors.Clear();
+                EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+
+                // 将主屏排在第一位，方便直观识别
+                enumeratedMonitors.Sort((a, b) =>
+                {
+                    if (a.IsPrimary != b.IsPrimary) return a.IsPrimary ? -1 : 1;
+                    if (a.Bounds.Left != b.Bounds.Left) return a.Bounds.Left.CompareTo(b.Bounds.Left);
+                    return a.Bounds.Top.CompareTo(b.Bounds.Top);
+                });
+
+                hMenu = CreatePopupMenu();
+                if (hMenu == IntPtr.Zero) return;
+
+                AppendMenuW(hMenu, MF_STRING, (UIntPtr)ID_MENU_BLACKOUT_ALL, "一键黑屏");
+                AppendMenuW(hMenu, MF_STRING, (UIntPtr)ID_MENU_BLACKOUT_MAIN, "主屏黑屏");
+
+                bool hasSubMonitors = enumeratedMonitors.Exists(m => !m.IsPrimary);
+                AppendMenuW(hMenu, MF_STRING | (hasSubMonitors ? 0 : MF_GRAYED), (UIntPtr)ID_MENU_BLACKOUT_SUB, "副屏黑屏");
+
+                if (enumeratedMonitors.Count > 1)
+                {
+                    hScreenSubMenu = CreatePopupMenu();
+                    for (int i = 0; i < enumeratedMonitors.Count; i++)
+                    {
+                        MonitorTarget m = enumeratedMonitors[i];
+                        string role = m.IsPrimary ? " · 主屏" : "";
+                        string label = $"屏幕 {i + 1}{role} ({m.Bounds.Width}×{m.Bounds.Height})";
+                        AppendMenuW(hScreenSubMenu, MF_STRING, (UIntPtr)(ID_MENU_SCREEN_BASE + i), label);
+                    }
+                    AppendMenuW(hMenu, MF_POPUP, (UIntPtr)(ulong)hScreenSubMenu, "指定屏幕");
+                }
+
+                AppendMenuW(hMenu, MF_SEPARATOR, UIntPtr.Zero, null);
+
+                bool autoStart = IsAutoStartEnabled();
+                AppendMenuW(hMenu, MF_STRING | (autoStart ? MF_CHECKED : 0), (UIntPtr)ID_MENU_AUTOSTART, "开机自启");
+                AppendMenuW(hMenu, MF_STRING, (UIntPtr)ID_MENU_RESTART, "重启软件");
+
+                AppendMenuW(hMenu, MF_SEPARATOR, UIntPtr.Zero, null);
+                AppendMenuW(hMenu, MF_STRING, (UIntPtr)ID_MENU_EXIT, "退出");
+
+                // 强制将系统菜单弹出方向设为左对齐（即从鼠标位置向右上方展开，覆盖平板/手写笔默认左偏设置）
+                SystemParametersInfoW(SPI_GETMENUDROPALIGNMENT, 0, ref prevDropAlignment, 0);
+                if (prevDropAlignment != 0)
+                {
+                    SystemParametersInfoW(SPI_SETMENUDROPALIGNMENT, 0, IntPtr.Zero, 0);
+                }
+
+                GetCursorPos(out PointStruct pt);
+                SetForegroundWindow(trayMessageWindow.Handle);
+
+                int cmd = TrackPopupMenuEx(
+                    hMenu,
+                    TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                    pt.X,
+                    pt.Y,
+                    trayMessageWindow.Handle,
+                    IntPtr.Zero);
+
+                PostMessageW(trayMessageWindow.Handle, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+
+                if (prevDropAlignment != 0)
+                {
+                    SystemParametersInfoW(SPI_SETMENUDROPALIGNMENT, (uint)prevDropAlignment, IntPtr.Zero, 0);
+                    restoredAlignment = true;
+                }
+
+                if (cmd == ID_MENU_BLACKOUT_ALL)
+                {
+                    EnterBlackoutMode();
+                }
+                else if (cmd == ID_MENU_BLACKOUT_MAIN)
+                {
+                    EnterBlackoutMode(mainScreenOnly: true);
+                }
+                else if (cmd == ID_MENU_BLACKOUT_SUB)
+                {
+                    EnterBlackoutMode(otherScreensOnly: true);
+                }
+                else if (cmd >= ID_MENU_SCREEN_BASE && cmd < ID_MENU_SCREEN_BASE + enumeratedMonitors.Count)
+                {
+                    int index = cmd - ID_MENU_SCREEN_BASE;
+                    EnterBlackoutMode(singleMonitorHandle: enumeratedMonitors[index].Handle);
+                }
+                else if (cmd == ID_MENU_AUTOSTART)
+                {
+                    ToggleAutoStart();
+                }
+                else if (cmd == ID_MENU_RESTART)
+                {
+                    RestartApplication();
+                }
+                else if (cmd == ID_MENU_EXIT)
+                {
+                    ExitApplication();
+                }
+            }
+            finally
+            {
+                if (!restoredAlignment && prevDropAlignment != 0)
+                {
+                    SystemParametersInfoW(SPI_SETMENUDROPALIGNMENT, (uint)prevDropAlignment, IntPtr.Zero, 0);
+                }
+                if (hMenu != IntPtr.Zero)
+                {
+                    DestroyMenu(hMenu);
+                }
+                _isMenuOpen = false;
             }
         }
 
@@ -589,30 +819,13 @@ namespace Blackout
             singleInstanceMutex = null;
         }
 
-        private static void ContextMenu_Opening(object sender, System.ComponentModel.CancelEventArgs e)
-        {
-            if (windows.Count > 0)
-            {
-                CloseAllWindows();
-                e.Cancel = true;
-                return;
-            }
-
-            autoStartMenuItem.Checked = IsAutoStartEnabled();
-        }
-
-        private static void AutoStartMenuItem_Click(object sender, EventArgs e)
+        private static void ToggleAutoStart()
         {
             bool enable = !IsAutoStartEnabled();
-
-            if (SetAutoStartEnabled(enable, out string errorMessage))
+            if (!SetAutoStartEnabled(enable, out string errorMessage))
             {
-                autoStartMenuItem.Checked = enable;
-                return;
+                MessageBox.Show(errorMessage, "Blackout", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
-
-            MessageBox.Show(errorMessage, "Blackout", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            autoStartMenuItem.Checked = IsAutoStartEnabled();
         }
 
         private static bool IsAutoStartEnabled()
@@ -789,7 +1002,6 @@ namespace Blackout
                     return true;
                 }
 
-                // 降级兜底
                 string fallbackArgs = $"/Create /F /TN \"{AutoStartTaskName}\" /SC ONLOGON /RL HIGHEST /TR \"\\\"{exePath}\\\"\"";
                 if (RunSchtasksCommand(fallbackArgs, out _, out errorMessage))
                 {
@@ -846,49 +1058,7 @@ namespace Blackout
             }
         }
 
-        private static void NotifyIcon_MouseClick(object sender, MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left)
-            {
-                if (windows.Count > 0)
-                {
-                    CloseAllWindows();
-                }
-                else
-                {
-                    EnterBlackoutMode();
-                }
-            }
-        }
-
-        private static void BlackoutMenuItem_Click(object sender, EventArgs e)
-        {
-            if (windows.Count > 0)
-            {
-                CloseAllWindows();
-            }
-            EnterBlackoutMode();
-        }
-
-        private static void BlackoutMainScreenMenuItem_Click(object sender, EventArgs e)
-        {
-            if (windows.Count > 0)
-            {
-                CloseAllWindows();
-            }
-            EnterBlackoutMode(mainScreenOnly: true);
-        }
-
-        private static void BlackoutOtherScreensMenuItem_Click(object sender, EventArgs e)
-        {
-            if (windows.Count > 0)
-            {
-                CloseAllWindows();
-            }
-            EnterBlackoutMode(otherScreensOnly: true);
-        }
-
-        private static void RestartMenuItem_Click(object sender, EventArgs e)
+        private static void RestartApplication()
         {
             try
             {
@@ -902,7 +1072,6 @@ namespace Blackout
                     notifyIcon.Dispose();
                     notifyIcon = null;
                 }
-                // 必须在拉起新进程前释放单实例 Mutex，防止新实例检测到锁未释放而自杀退出
                 ReleaseSingleInstanceMutex();
 
                 Process.Start(new ProcessStartInfo
@@ -918,7 +1087,7 @@ namespace Blackout
             Application.Exit();
         }
 
-        private static void ExitMenuItem_Click(object sender, EventArgs e)
+        private static void ExitApplication()
         {
             if (windows.Count > 0)
             {
@@ -963,10 +1132,15 @@ namespace Blackout
             _brightnessCaptured = true;
         }
 
-        private static void EnterBlackoutMode(bool mainScreenOnly = false, bool otherScreensOnly = false)
+        private static void EnterBlackoutMode(bool mainScreenOnly = false, bool otherScreensOnly = false, IntPtr singleMonitorHandle = default)
         {
+            if (windows.Count > 0)
+            {
+                CloseAllWindows();
+            }
+
             Interlocked.Exchange(ref _isClosing, 0);
-            _isAllScreensBlackout = !mainScreenOnly && !otherScreensOnly;
+            _isAllScreensBlackout = !mainScreenOnly && !otherScreensOnly && singleMonitorHandle == IntPtr.Zero;
 
             enumeratedMonitors.Clear();
             EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
@@ -974,7 +1148,22 @@ namespace Blackout
             CaptureInitialBrightnessIfNeeded();
 
             // 根据目标模式设置显示器亮度
-            if (mainScreenOnly)
+            if (singleMonitorHandle != IntPtr.Zero)
+            {
+                MonitorTarget selected = enumeratedMonitors.Find(m => m.Handle == singleMonitorHandle);
+                if (selected.Handle != IntPtr.Zero)
+                {
+                    if (selected.IsPrimary)
+                    {
+                        RestoreMainMonitorBrightness(0);
+                    }
+                    else
+                    {
+                        SetMonitorBrightnessForPhysicalMonitors(selected.Handle, 0);
+                    }
+                }
+            }
+            else if (mainScreenOnly)
             {
                 RestoreMainMonitorBrightness(0);
             }
@@ -998,9 +1187,10 @@ namespace Blackout
             foreach (MonitorTarget target in enumeratedMonitors)
             {
                 bool shouldBlackout =
-                    (!mainScreenOnly && !otherScreensOnly) ||
-                    (mainScreenOnly && target.IsPrimary) ||
-                    (otherScreensOnly && !target.IsPrimary);
+                    (singleMonitorHandle != IntPtr.Zero && target.Handle == singleMonitorHandle) ||
+                    (singleMonitorHandle == IntPtr.Zero && !mainScreenOnly && !otherScreensOnly) ||
+                    (singleMonitorHandle == IntPtr.Zero && mainScreenOnly && target.IsPrimary) ||
+                    (singleMonitorHandle == IntPtr.Zero && otherScreensOnly && !target.IsPrimary);
 
                 if (shouldBlackout)
                 {
@@ -1120,7 +1310,6 @@ namespace Blackout
             if (GetClassNameW(hWnd, sb, sb.Capacity) == 0) return false;
             string cls = sb.ToString();
 
-            // 仅针对系统任务栏、DisplayFusion 任务栏与系统通知横幅进行压制，100% 保护 TXGuiFoundation (QQ/微信截图)
             if (string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase)) return true;
             if (string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase)) return true;
             if (cls.StartsWith("DFTaskbar", StringComparison.OrdinalIgnoreCase)) return true;
@@ -1149,7 +1338,6 @@ namespace Blackout
                 return;
             }
 
-            // 番茄钟 v2.5.29 同款精准门禁：仅放行当前黑屏物理显示器上的可压制任务栏/通知弹窗
             if (eventType == EVENT_OBJECT_SHOW)
             {
                 if (!IsSuppressibleWindow(hwnd) || !IsOnBlackoutMonitorHandle(hwnd))
@@ -1230,7 +1418,6 @@ namespace Blackout
                 return true;
             }
 
-            // 内核级 HMONITOR 物理屏幕严格匹配：绝不触碰未黑屏副屏上的 DisplayFusion 任务栏
             IntPtr winMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL);
             if (winMon == IntPtr.Zero || !activeBlackoutMonitors.Contains(winMon))
             {
