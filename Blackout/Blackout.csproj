@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<OutputType>WinExe</OutputType>
@@ -6,6 +6,10 @@
 		<UseWindowsForms>true</UseWindowsForms>
 		<ApplicationManifest>app.manifest</ApplicationManifest>
 		<ApplicationIcon>黑屏.ico</ApplicationIcon>
+		<ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+		<Version>1.2.0</Version>
+		<FileVersion>1.2.0.0</FileVersion>
+		<AssemblyVersion>1.2.0.0</AssemblyVersion>
 		<Platforms>AnyCPU;ARM64;x64</Platforms>
 	</PropertyGroup>
 
