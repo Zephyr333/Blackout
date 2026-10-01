@@ -3,11 +3,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Management;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -18,20 +20,24 @@ namespace Blackout
         private struct MonitorTarget
         {
             public IntPtr Handle;
+            public string DeviceName;
             public Rectangle Bounds;
             public bool IsPrimary;
         }
 
         private sealed class BlackoutOverlayForm : Form
         {
-            public IntPtr MonitorHandle { get; }
-            public Rectangle PhysicalBounds { get; }
+            public IntPtr MonitorHandle { get; set; }
+            public string DeviceName { get; }
+            public Rectangle PhysicalBounds { get; set; }
 
-            public BlackoutOverlayForm(IntPtr monitorHandle, Rectangle physicalBounds, Cursor blankCursor)
+            public BlackoutOverlayForm(IntPtr monitorHandle, string deviceName, Rectangle physicalBounds, Cursor blankCursor)
             {
                 MonitorHandle = monitorHandle;
+                DeviceName = deviceName;
                 PhysicalBounds = physicalBounds;
 
+                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.Opaque, true);
                 FormBorderStyle = FormBorderStyle.None;
                 WindowState = FormWindowState.Normal;
                 BackColor = Color.Black;
@@ -58,7 +64,12 @@ namespace Blackout
                 }
             }
 
-            protected override bool ShowWithoutActivation => false;
+            protected override bool ShowWithoutActivation => true;
+
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                // 空实现拦截系统默认灰色擦除，消除创建窗口瞬间的微闪烁
+            }
         }
 
         private sealed class TrayMessageWindow : NativeWindow
@@ -108,6 +119,10 @@ namespace Blackout
                     ExitApplication();
                     return;
                 }
+                else if (m.Msg == WM_DISPLAYCHANGE || m.Msg == WM_DPICHANGED)
+                {
+                    OnDisplayOrDpiChanged();
+                }
                 base.WndProc(ref m);
             }
         }
@@ -151,10 +166,13 @@ namespace Blackout
         private const uint SPI_SETMENUDROPALIGNMENT = 0x001C;
         private const uint MSGFLT_ALLOW = 1;
 
-        // 存储当前所有黑屏窗口与已黑屏显示器句柄
+        // 存储当前所有黑屏窗口与已黑屏显示器标识（同时维护设备名与物理句柄）
         private static readonly List<BlackoutOverlayForm> windows = new List<BlackoutOverlayForm>();
+        private static readonly HashSet<string> activeBlackoutDevices = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<IntPtr> activeBlackoutMonitors = new HashSet<IntPtr>();
         private static readonly List<MonitorTarget> enumeratedMonitors = new List<MonitorTarget>();
+        private static IntPtr _previousForegroundWindow = IntPtr.Zero;
+        private static System.Windows.Forms.Timer _displayChangeDebounceTimer;
 
         // 原始亮度缓存（仅在从正常亮屏首次进入黑屏时采集锁定，防止切换模式时将 0 亮度误存为原始亮度）
         private static bool _brightnessCaptured;
@@ -163,6 +181,7 @@ namespace Blackout
 
         // 静态常驻 Win32 回调委托（严禁动态分配，防止被 .NET GC 回收引发 0xc0000005 原生崩溃）
         private static readonly LowLevelKeyboardProc _keyboardHookProc = HookCallback;
+        private static readonly LowLevelMouseProc _mouseHookProc = TrayDragMouseHookCallback;
         private static readonly WinEventDelegate _winEventProc = WinEventCallback;
         private static readonly EnumWindowsProc _enumWindowsProc = SuppressEnumWindowsProc;
         private static readonly MonitorEnumDelegate _monitorEnumProc = MonitorEnumCallback;
@@ -172,10 +191,22 @@ namespace Blackout
         private static int _isClosing;
         private static bool _isAllScreensBlackout;
 
+        // 托盘拖拽与鼠标钩子状态
+        private static bool _isTrayMouseDown;
+        private static Point _trayMouseDownPoint;
+        private static bool _trayDragExceeded;
+        private static bool _suppressNextTrayClick;
+        private static IntPtr _mouseHookID = IntPtr.Zero;
+
         // 常量定义
         private const int WH_KEYBOARD_LL = 13;
+        private const int WH_MOUSE_LL = 14;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_MOUSEMOVE = 0x0200;
+        private const int WM_LBUTTONUP = 0x0202;
+        private const int WM_DISPLAYCHANGE = 0x007E;
+        private const int WM_DPICHANGED = 0x02E0;
 
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
@@ -189,6 +220,8 @@ namespace Blackout
         private const uint INITIAL_PLACE_FLAGS = SWP_SHOWWINDOW | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING;
 
         private const uint MONITOR_DEFAULTTONULL = 0x00000000;
+        private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
+        private const uint GA_ROOT = 2;
         private const int OBJID_WINDOW = 0;
         private const int CHILDID_SELF = 0;
 
@@ -304,6 +337,9 @@ namespace Blackout
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
         [DllImport("user32.dll")]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll")]
         private static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
         [DllImport("user32.dll")]
@@ -336,8 +372,15 @@ namespace Blackout
         [DllImport("user32.dll")]
         private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(PointStruct point);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
         private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref Rect lprcMonitor, IntPtr dwData);
 
@@ -346,6 +389,16 @@ namespace Blackout
         {
             public int X;
             public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public PointStruct pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -563,6 +616,7 @@ namespace Blackout
                 Text = "Blackout",
                 Visible = true
             };
+            notifyIcon.MouseDown += NotifyIcon_MouseDown;
             notifyIcon.MouseUp += NotifyIcon_MouseUp;
         }
 
@@ -590,6 +644,12 @@ namespace Blackout
         {
             if (e.Button == MouseButtons.Left)
             {
+                if (_suppressNextTrayClick)
+                {
+                    _suppressNextTrayClick = false;
+                    return;
+                }
+
                 if (windows.Count > 0)
                 {
                     CloseAllWindows();
@@ -601,12 +661,6 @@ namespace Blackout
             }
             else if (e.Button == MouseButtons.Right)
             {
-                if (windows.Count > 0)
-                {
-                    CloseAllWindows();
-                    return;
-                }
-
                 ShowNativeTrayMenu();
             }
         }
@@ -642,11 +696,17 @@ namespace Blackout
                 hMenu = CreatePopupMenu();
                 if (hMenu == IntPtr.Zero) return;
 
-                AppendMenuW(hMenu, MF_STRING, (UIntPtr)ID_MENU_BLACKOUT_ALL, "一键黑屏");
-                AppendMenuW(hMenu, MF_STRING, (UIntPtr)ID_MENU_BLACKOUT_MAIN, "主屏黑屏");
+                bool isAllBlackout = _isAllScreensBlackout || (enumeratedMonitors.Count > 0 && windows.Count == enumeratedMonitors.Count);
+                string allLabel = isAllBlackout ? "退出黑屏" : "一键黑屏";
+                AppendMenuW(hMenu, MF_STRING | (isAllBlackout ? MF_CHECKED : 0), (UIntPtr)ID_MENU_BLACKOUT_ALL, allLabel);
+
+                MonitorTarget primaryMon = enumeratedMonitors.Find(m => m.IsPrimary);
+                bool isPrimaryBlackout = primaryMon.Handle != IntPtr.Zero && IsMonitorBlackout(primaryMon);
+                AppendMenuW(hMenu, MF_STRING | (isPrimaryBlackout ? MF_CHECKED : 0), (UIntPtr)ID_MENU_BLACKOUT_MAIN, "主屏黑屏");
 
                 bool hasSubMonitors = enumeratedMonitors.Exists(m => !m.IsPrimary);
-                AppendMenuW(hMenu, MF_STRING | (hasSubMonitors ? 0 : MF_GRAYED), (UIntPtr)ID_MENU_BLACKOUT_SUB, "副屏黑屏");
+                bool isSubBlackout = hasSubMonitors && enumeratedMonitors.Where(m => !m.IsPrimary).All(IsMonitorBlackout);
+                AppendMenuW(hMenu, MF_STRING | (hasSubMonitors ? 0 : MF_GRAYED) | (isSubBlackout ? MF_CHECKED : 0), (UIntPtr)ID_MENU_BLACKOUT_SUB, "副屏黑屏");
 
                 if (enumeratedMonitors.Count > 1)
                 {
@@ -654,9 +714,10 @@ namespace Blackout
                     for (int i = 0; i < enumeratedMonitors.Count; i++)
                     {
                         MonitorTarget m = enumeratedMonitors[i];
+                        bool isMonBlackout = IsMonitorBlackout(m);
                         string role = m.IsPrimary ? " · 主屏" : "";
                         string label = $"屏幕 {i + 1}{role} ({m.Bounds.Width}×{m.Bounds.Height})";
-                        AppendMenuW(hScreenSubMenu, MF_STRING, (UIntPtr)(ID_MENU_SCREEN_BASE + i), label);
+                        AppendMenuW(hScreenSubMenu, MF_STRING | (isMonBlackout ? MF_CHECKED : 0), (UIntPtr)(ID_MENU_SCREEN_BASE + i), label);
                     }
                     AppendMenuW(hMenu, MF_POPUP, (UIntPtr)(ulong)hScreenSubMenu, "指定屏幕");
                 }
@@ -698,20 +759,27 @@ namespace Blackout
 
                 if (cmd == ID_MENU_BLACKOUT_ALL)
                 {
-                    EnterBlackoutMode();
+                    if (isAllBlackout)
+                    {
+                        CloseAllWindows();
+                    }
+                    else
+                    {
+                        EnterBlackoutMode();
+                    }
                 }
                 else if (cmd == ID_MENU_BLACKOUT_MAIN)
                 {
-                    EnterBlackoutMode(mainScreenOnly: true);
+                    ToggleMainScreenBlackout();
                 }
                 else if (cmd == ID_MENU_BLACKOUT_SUB)
                 {
-                    EnterBlackoutMode(otherScreensOnly: true);
+                    ToggleSubScreensBlackout();
                 }
                 else if (cmd >= ID_MENU_SCREEN_BASE && cmd < ID_MENU_SCREEN_BASE + enumeratedMonitors.Count)
                 {
                     int index = cmd - ID_MENU_SCREEN_BASE;
-                    EnterBlackoutMode(singleMonitorHandle: enumeratedMonitors[index].Handle);
+                    ToggleSingleScreenBlackout(enumeratedMonitors[index]);
                 }
                 else if (cmd == ID_MENU_AUTOSTART)
                 {
@@ -764,6 +832,14 @@ namespace Blackout
 
         private static void CleanupResourcesOnExit()
         {
+            try
+            {
+                StopTrayDragHook();
+            }
+            catch
+            {
+            }
+
             try
             {
                 if (windows.Count > 0)
@@ -1142,6 +1218,11 @@ namespace Blackout
             Interlocked.Exchange(ref _isClosing, 0);
             _isAllScreensBlackout = !mainScreenOnly && !otherScreensOnly && singleMonitorHandle == IntPtr.Zero;
 
+            if (_previousForegroundWindow == IntPtr.Zero)
+            {
+                _previousForegroundWindow = GetForegroundWindow();
+            }
+
             enumeratedMonitors.Clear();
             EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
 
@@ -1182,6 +1263,7 @@ namespace Blackout
             }
 
             windows.Clear();
+            activeBlackoutDevices.Clear();
             activeBlackoutMonitors.Clear();
 
             foreach (MonitorTarget target in enumeratedMonitors)
@@ -1196,6 +1278,10 @@ namespace Blackout
                 {
                     BlackoutOverlayForm form = CreateBlackoutForm(target);
                     windows.Add(form);
+                    if (!string.IsNullOrEmpty(target.DeviceName))
+                    {
+                        activeBlackoutDevices.Add(target.DeviceName);
+                    }
                     activeBlackoutMonitors.Add(target.Handle);
                 }
             }
@@ -1213,13 +1299,18 @@ namespace Blackout
                     INITIAL_PLACE_FLAGS);
             }
 
+            if (_isAllScreensBlackout && windows.Count > 0)
+            {
+                SetForegroundWindow(windows[0].Handle);
+            }
+
             StartTopmostGuard();
             MaintainBlackoutLayer(forceSuppress: true);
         }
 
         private static BlackoutOverlayForm CreateBlackoutForm(MonitorTarget target)
         {
-            BlackoutOverlayForm form = new BlackoutOverlayForm(target.Handle, target.Bounds, blankCursor);
+            BlackoutOverlayForm form = new BlackoutOverlayForm(target.Handle, target.DeviceName, target.Bounds, blankCursor);
 
             form.KeyDown += (sender, e) =>
             {
@@ -1231,7 +1322,11 @@ namespace Blackout
 
             form.MouseDown += (sender, e) =>
             {
-                CloseAllWindows();
+                if (e.Button == MouseButtons.Left)
+                {
+                    CloseAllWindows();
+                }
+                // 右键完全静默忽略（不退出、无任何功能）
             };
 
             form.Load += (sender, e) =>
@@ -1467,7 +1562,7 @@ namespace Blackout
         private static bool IsFocusOrCursorOnBlackoutMonitor()
         {
             if (_isAllScreensBlackout) return true;
-            if (activeBlackoutMonitors.Count == 0) return false;
+            if (activeBlackoutMonitors.Count == 0 && activeBlackoutDevices.Count == 0) return false;
 
             if (GetCursorPos(out PointStruct pt))
             {
@@ -1499,8 +1594,19 @@ namespace Blackout
 
                 if (vkCode == (int)Keys.Escape)
                 {
-                    syncContext?.Post(_ => CloseAllWindows(), null);
-                    return (IntPtr)1;
+                    if (_isTrayMouseDown)
+                    {
+                        _isTrayMouseDown = false;
+                        _trayDragExceeded = false;
+                        StopTrayDragHook();
+                        return (IntPtr)1;
+                    }
+
+                    if (_isAllScreensBlackout || IsFocusOrCursorOnBlackoutMonitor())
+                    {
+                        syncContext?.Post(_ => CloseAllWindows(), null);
+                        return (IntPtr)1;
+                    }
                 }
                 else if ((vkCode == (int)Keys.LWin || vkCode == (int)Keys.RWin) && IsFocusOrCursorOnBlackoutMonitor())
                 {
@@ -1531,7 +1637,9 @@ namespace Blackout
             {
                 StopTopmostGuard();
                 RestoreHiddenWindows();
+                activeBlackoutDevices.Clear();
                 activeBlackoutMonitors.Clear();
+                _isAllScreensBlackout = false;
 
                 List<BlackoutOverlayForm> toClose = new List<BlackoutOverlayForm>(windows);
                 windows.Clear();
@@ -1556,6 +1664,12 @@ namespace Blackout
                     UnhookWindowsHookEx(_hookID);
                     _hookID = IntPtr.Zero;
                 }
+
+                if (_previousForegroundWindow != IntPtr.Zero && IsWindow(_previousForegroundWindow))
+                {
+                    SetForegroundWindow(_previousForegroundWindow);
+                }
+                _previousForegroundWindow = IntPtr.Zero;
 
                 RestoreBrightness();
             }
@@ -1603,22 +1717,25 @@ namespace Blackout
                 return;
             }
 
-            try
-            {
-                RestoreMainMonitorBrightness(_savedMainBrightness);
+            int savedMain = _savedMainBrightness;
+            var savedMonitors = new Dictionary<IntPtr, int>(_savedMonitorBrightness);
+            _brightnessCaptured = false;
 
-                foreach (KeyValuePair<IntPtr, int> kv in _savedMonitorBrightness)
+            Task.Run(() =>
+            {
+                try
                 {
-                    SetMonitorBrightnessForPhysicalMonitors(kv.Key, kv.Value);
+                    RestoreMainMonitorBrightness(savedMain);
+
+                    foreach (KeyValuePair<IntPtr, int> kv in savedMonitors)
+                    {
+                        SetMonitorBrightnessForPhysicalMonitors(kv.Key, kv.Value);
+                    }
                 }
-            }
-            catch
-            {
-            }
-            finally
-            {
-                _brightnessCaptured = false;
-            }
+                catch
+                {
+                }
+            });
         }
 
         private static void RestoreMainMonitorBrightness(int brightness)
@@ -1751,6 +1868,7 @@ namespace Blackout
             enumeratedMonitors.Add(new MonitorTarget
             {
                 Handle = hMonitor,
+                DeviceName = mi.DeviceName ?? string.Empty,
                 Bounds = new Rectangle(mi.Monitor.Left, mi.Monitor.Top, width, height),
                 IsPrimary = (mi.Flags & 1) != 0
             });
@@ -1763,6 +1881,361 @@ namespace Blackout
             mi.Size = Marshal.SizeOf(typeof(MonitorInfoEx));
             GetMonitorInfo(hMonitor, ref mi);
             return mi;
+        }
+
+        private static bool IsMonitorBlackout(MonitorTarget target)
+        {
+            if (!string.IsNullOrEmpty(target.DeviceName) && activeBlackoutDevices.Contains(target.DeviceName))
+            {
+                return true;
+            }
+            return activeBlackoutMonitors.Contains(target.Handle);
+        }
+
+        private static void ToggleSingleScreenBlackout(MonitorTarget target)
+        {
+            if (IsMonitorBlackout(target))
+            {
+                RemoveScreenBlackout(target);
+            }
+            else
+            {
+                AddScreenBlackout(target);
+            }
+        }
+
+        private static void ToggleMainScreenBlackout()
+        {
+            enumeratedMonitors.Clear();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+            MonitorTarget primary = enumeratedMonitors.Find(m => m.IsPrimary);
+            if (primary.Handle != IntPtr.Zero)
+            {
+                ToggleSingleScreenBlackout(primary);
+            }
+        }
+
+        private static void ToggleSubScreensBlackout()
+        {
+            enumeratedMonitors.Clear();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+            List<MonitorTarget> subs = enumeratedMonitors.FindAll(m => !m.IsPrimary);
+            if (subs.Count == 0) return;
+
+            bool allSubsBlackout = subs.All(IsMonitorBlackout);
+            if (allSubsBlackout)
+            {
+                foreach (MonitorTarget s in subs)
+                {
+                    RemoveScreenBlackout(s);
+                }
+            }
+            else
+            {
+                foreach (MonitorTarget s in subs)
+                {
+                    if (!IsMonitorBlackout(s))
+                    {
+                        AddScreenBlackout(s);
+                    }
+                }
+            }
+        }
+
+        private static void AddScreenBlackout(MonitorTarget target)
+        {
+            Interlocked.Exchange(ref _isClosing, 0);
+
+            if (windows.Count == 0)
+            {
+                _previousForegroundWindow = GetForegroundWindow();
+                CaptureInitialBrightnessIfNeeded();
+                if (_hookID == IntPtr.Zero)
+                {
+                    _hookID = SetHook(_keyboardHookProc);
+                }
+            }
+
+            if (windows.Exists(w => (!string.IsNullOrEmpty(w.DeviceName) && w.DeviceName == target.DeviceName) || w.MonitorHandle == target.Handle))
+            {
+                return;
+            }
+
+            if (target.IsPrimary)
+            {
+                RestoreMainMonitorBrightness(0);
+            }
+            else
+            {
+                SetMonitorBrightnessForPhysicalMonitors(target.Handle, 0);
+            }
+
+            BlackoutOverlayForm form = CreateBlackoutForm(target);
+            windows.Add(form);
+            if (!string.IsNullOrEmpty(target.DeviceName))
+            {
+                activeBlackoutDevices.Add(target.DeviceName);
+            }
+            activeBlackoutMonitors.Add(target.Handle);
+
+            form.Show();
+            SetWindowPos(
+                form.Handle,
+                HWND_TOPMOST,
+                target.Bounds.Left,
+                target.Bounds.Top,
+                target.Bounds.Width,
+                target.Bounds.Height,
+                INITIAL_PLACE_FLAGS);
+
+            _isAllScreensBlackout = (enumeratedMonitors.Count > 0 && windows.Count == enumeratedMonitors.Count);
+
+            StartTopmostGuard();
+            MaintainBlackoutLayer(forceSuppress: true);
+        }
+
+        private static void RemoveScreenBlackout(MonitorTarget target)
+        {
+            BlackoutOverlayForm form = windows.Find(w => (!string.IsNullOrEmpty(w.DeviceName) && w.DeviceName == target.DeviceName) || w.MonitorHandle == target.Handle);
+            if (form != null)
+            {
+                windows.Remove(form);
+                try
+                {
+                    form.Close();
+                    form.Dispose();
+                }
+                catch
+                {
+                }
+            }
+
+            if (!string.IsNullOrEmpty(target.DeviceName))
+            {
+                activeBlackoutDevices.Remove(target.DeviceName);
+            }
+            activeBlackoutMonitors.Remove(target.Handle);
+
+            if (target.IsPrimary)
+            {
+                RestoreMainMonitorBrightness(_savedMainBrightness);
+            }
+            else if (_savedMonitorBrightness.TryGetValue(target.Handle, out int savedB))
+            {
+                SetMonitorBrightnessForPhysicalMonitors(target.Handle, savedB);
+            }
+
+            if (windows.Count == 0)
+            {
+                CloseAllWindows();
+                return;
+            }
+
+            _isAllScreensBlackout = false;
+            RestoreHiddenWindows();
+            MaintainBlackoutLayer(forceSuppress: true);
+        }
+
+        private static void OnDisplayOrDpiChanged()
+        {
+            if (windows.Count == 0) return;
+
+            if (_displayChangeDebounceTimer == null)
+            {
+                _displayChangeDebounceTimer = new System.Windows.Forms.Timer { Interval = 200 };
+                _displayChangeDebounceTimer.Tick += (s, e) =>
+                {
+                    _displayChangeDebounceTimer.Stop();
+                    ReconcileMonitorsLayout();
+                };
+            }
+            _displayChangeDebounceTimer.Stop();
+            _displayChangeDebounceTimer.Start();
+        }
+
+        private static void ReconcileMonitorsLayout()
+        {
+            if (windows.Count == 0) return;
+
+            enumeratedMonitors.Clear();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+
+            activeBlackoutMonitors.Clear();
+            List<BlackoutOverlayForm> toRemove = new List<BlackoutOverlayForm>();
+
+            foreach (BlackoutOverlayForm form in windows)
+            {
+                MonitorTarget matched = enumeratedMonitors.Find(m =>
+                    (!string.IsNullOrEmpty(form.DeviceName) && m.DeviceName == form.DeviceName) ||
+                    m.Handle == form.MonitorHandle);
+
+                if (matched.Handle != IntPtr.Zero)
+                {
+                    form.MonitorHandle = matched.Handle;
+                    activeBlackoutMonitors.Add(matched.Handle);
+
+                    if (form.PhysicalBounds != matched.Bounds)
+                    {
+                        form.PhysicalBounds = matched.Bounds;
+                        form.Bounds = matched.Bounds;
+                        SetWindowPos(
+                            form.Handle,
+                            HWND_TOPMOST,
+                            matched.Bounds.Left,
+                            matched.Bounds.Top,
+                            matched.Bounds.Width,
+                            matched.Bounds.Height,
+                            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+                    }
+                }
+                else
+                {
+                    toRemove.Add(form);
+                }
+            }
+
+            foreach (BlackoutOverlayForm form in toRemove)
+            {
+                windows.Remove(form);
+                if (!string.IsNullOrEmpty(form.DeviceName))
+                {
+                    activeBlackoutDevices.Remove(form.DeviceName);
+                }
+                try
+                {
+                    form.Close();
+                    form.Dispose();
+                }
+                catch { }
+            }
+
+            if (windows.Count == 0)
+            {
+                CloseAllWindows();
+            }
+            else
+            {
+                MaintainBlackoutLayer(forceSuppress: true);
+            }
+        }
+
+        private static void NotifyIcon_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                _isTrayMouseDown = true;
+                _trayDragExceeded = false;
+                GetCursorPos(out PointStruct pt);
+                _trayMouseDownPoint = new Point(pt.X, pt.Y);
+                StartTrayDragHook();
+            }
+        }
+
+        private static void StartTrayDragHook()
+        {
+            if (_mouseHookID == IntPtr.Zero)
+            {
+                using (Process curProcess = Process.GetCurrentProcess())
+                using (ProcessModule curModule = curProcess.MainModule)
+                {
+                    _mouseHookID = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc, GetModuleHandle(curModule.ModuleName), 0);
+                }
+            }
+        }
+
+        private static void StopTrayDragHook()
+        {
+            if (_mouseHookID != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_mouseHookID);
+                _mouseHookID = IntPtr.Zero;
+            }
+        }
+
+        private static IntPtr TrayDragMouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int msg = (int)wParam;
+                if (msg == WM_MOUSEMOVE)
+                {
+                    if (_isTrayMouseDown)
+                    {
+                        MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                        int dx = Math.Abs(hookStruct.pt.X - _trayMouseDownPoint.X);
+                        int dy = Math.Abs(hookStruct.pt.Y - _trayMouseDownPoint.Y);
+                        int dragThresholdX = SystemInformation.DragSize.Width;
+                        int dragThresholdY = SystemInformation.DragSize.Height;
+                        if (dx >= dragThresholdX || dy >= dragThresholdY)
+                        {
+                            _trayDragExceeded = true;
+                        }
+                    }
+                }
+                else if (msg == WM_LBUTTONUP)
+                {
+                    if (_isTrayMouseDown)
+                    {
+                        _isTrayMouseDown = false;
+                        MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                        StopTrayDragHook();
+
+                        if (_trayDragExceeded)
+                        {
+                            _suppressNextTrayClick = true;
+                            PointStruct dropPt = new PointStruct { X = hookStruct.pt.X, Y = hookStruct.pt.Y };
+
+                            if (!IsPointInTrayOrTaskbar(dropPt))
+                            {
+                                syncContext?.Post(_ => OnTrayDroppedOnScreen(dropPt), null);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        StopTrayDragHook();
+                    }
+                }
+            }
+            return CallNextHookEx(_mouseHookID, nCode, wParam, lParam);
+        }
+
+        private static void OnTrayDroppedOnScreen(PointStruct dropPt)
+        {
+            IntPtr hMon = MonitorFromPoint(dropPt, MONITOR_DEFAULTTONULL);
+            if (hMon == IntPtr.Zero) return;
+
+            enumeratedMonitors.Clear();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+
+            MonitorTarget target = enumeratedMonitors.Find(m => m.Handle == hMon);
+            if (target.Handle != IntPtr.Zero)
+            {
+                ToggleSingleScreenBlackout(target);
+            }
+        }
+
+        private static bool IsPointInTrayOrTaskbar(PointStruct pt)
+        {
+            IntPtr hWnd = WindowFromPoint(pt);
+            if (hWnd == IntPtr.Zero) return false;
+            IntPtr root = GetAncestor(hWnd, GA_ROOT);
+            if (root == IntPtr.Zero) root = hWnd;
+
+            StringBuilder sb = new StringBuilder(64);
+            if (GetClassNameW(root, sb, sb.Capacity) > 0)
+            {
+                string cls = sb.ToString();
+                if (string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "NotifyIconOverflowWindow", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "TopLevelWindowForOverflowXamlIsland", StringComparison.OrdinalIgnoreCase) ||
+                    cls.StartsWith("DFTaskbar", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 }
