@@ -180,6 +180,7 @@ namespace Blackout
 
         // 静态常驻 Win32 回调委托（严禁动态分配，防止被 .NET GC 回收引发 0xc0000005 原生崩溃）
         private static readonly LowLevelKeyboardProc _keyboardHookProc = HookCallback;
+        private static readonly LowLevelMouseProc _mouseHookProc = TrayDragMouseHookCallback;
         private static readonly WinEventDelegate _winEventProc = WinEventCallback;
         private static readonly EnumWindowsProc _enumWindowsProc = SuppressEnumWindowsProc;
         private static readonly MonitorEnumDelegate _monitorEnumProc = MonitorEnumCallback;
@@ -189,10 +190,20 @@ namespace Blackout
         private static int _isClosing;
         private static bool _isAllScreensBlackout;
 
+        // 托盘拖拽状态
+        private static bool _isTrayMouseDown;
+        private static Point _trayMouseDownPoint;
+        private static bool _trayDragExceeded;
+        private static long _suppressClickUntil;
+        private static IntPtr _mouseHookID = IntPtr.Zero;
+
         // 常量定义
         private const int WH_KEYBOARD_LL = 13;
+        private const int WH_MOUSE_LL = 14;
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_MOUSEMOVE = 0x0200;
+        private const int WM_LBUTTONUP = 0x0202;
         private const int WM_DISPLAYCHANGE = 0x007E;
         private const int WM_DPICHANGED = 0x02E0;
 
@@ -324,6 +335,9 @@ namespace Blackout
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
 
         [DllImport("user32.dll")]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll")]
         private static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
         [DllImport("user32.dll")]
@@ -358,6 +372,7 @@ namespace Blackout
 
         private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref Rect lprcMonitor, IntPtr dwData);
 
@@ -366,6 +381,16 @@ namespace Blackout
         {
             public int X;
             public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public PointStruct pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -583,6 +608,7 @@ namespace Blackout
                 Text = "Blackout",
                 Visible = true
             };
+            notifyIcon.MouseDown += NotifyIcon_MouseDown;
             notifyIcon.MouseUp += NotifyIcon_MouseUp;
         }
 
@@ -610,6 +636,11 @@ namespace Blackout
         {
             if (e.Button == MouseButtons.Left)
             {
+                if (Environment.TickCount64 < _suppressClickUntil)
+                {
+                    return;
+                }
+
                 if (windows.Count > 0)
                 {
                     CloseAllWindows();
@@ -792,6 +823,14 @@ namespace Blackout
 
         private static void CleanupResourcesOnExit()
         {
+            try
+            {
+                StopTrayDragHook();
+            }
+            catch
+            {
+            }
+
             try
             {
                 if (windows.Count > 0)
@@ -1546,6 +1585,14 @@ namespace Blackout
 
                 if (vkCode == (int)Keys.Escape)
                 {
+                    if (_isTrayMouseDown)
+                    {
+                        _isTrayMouseDown = false;
+                        _trayDragExceeded = false;
+                        StopTrayDragHook();
+                        return (IntPtr)1;
+                    }
+
                     if (_isAllScreensBlackout || IsFocusOrCursorOnBlackoutMonitor())
                     {
                         syncContext?.Post(_ => CloseAllWindows(), null);
@@ -2062,6 +2109,105 @@ namespace Blackout
                 MaintainBlackoutLayer(forceSuppress: true);
             }
         }
+
+        private static void NotifyIcon_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                _isTrayMouseDown = true;
+                _trayDragExceeded = false;
+                GetCursorPos(out PointStruct pt);
+                _trayMouseDownPoint = new Point(pt.X, pt.Y);
+                StartTrayDragHook();
+            }
+        }
+
+        private static void StartTrayDragHook()
+        {
+            if (_mouseHookID == IntPtr.Zero)
+            {
+                using (Process curProcess = Process.GetCurrentProcess())
+                using (ProcessModule curModule = curProcess.MainModule)
+                {
+                    _mouseHookID = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc, GetModuleHandle(curModule.ModuleName), 0);
+                }
+            }
+        }
+
+        private static void StopTrayDragHook()
+        {
+            if (_mouseHookID != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_mouseHookID);
+                _mouseHookID = IntPtr.Zero;
+            }
+        }
+
+        private static IntPtr TrayDragMouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int msg = (int)wParam;
+                if (msg == WM_MOUSEMOVE)
+                {
+                    if (_isTrayMouseDown)
+                    {
+                        MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                        int dx = Math.Abs(hookStruct.pt.X - _trayMouseDownPoint.X);
+                        int dy = Math.Abs(hookStruct.pt.Y - _trayMouseDownPoint.Y);
+                        int dragThreshold = Math.Max(16, SystemInformation.DragSize.Width * 3);
+                        if (dx >= dragThreshold || dy >= dragThreshold)
+                        {
+                            _trayDragExceeded = true;
+                        }
+                    }
+                }
+                else if (msg == WM_LBUTTONUP)
+                {
+                    if (_isTrayMouseDown)
+                    {
+                        _isTrayMouseDown = false;
+                        MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                        StopTrayDragHook();
+
+                        if (_trayDragExceeded)
+                        {
+                            _suppressClickUntil = Environment.TickCount64 + 400;
+                            Point dropPt = new Point(hookStruct.pt.X, hookStruct.pt.Y);
+                            int totalDist = Math.Abs(dropPt.X - _trayMouseDownPoint.X) + Math.Abs(dropPt.Y - _trayMouseDownPoint.Y);
+                            if (totalDist >= 35)
+                            {
+                                syncContext?.Post(_ => OnTrayDroppedOnScreen(dropPt), null);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        StopTrayDragHook();
+                    }
+                }
+            }
+            return CallNextHookEx(_mouseHookID, nCode, wParam, lParam);
+        }
+
+        private static void OnTrayDroppedOnScreen(Point dropPt)
+        {
+            Screen screen = Screen.FromPoint(dropPt);
+            if (screen == null) return;
+
+            enumeratedMonitors.Clear();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+
+            MonitorTarget target = enumeratedMonitors.Find(m =>
+                (!string.IsNullOrEmpty(m.DeviceName) && m.DeviceName == screen.DeviceName) ||
+                m.Bounds == screen.Bounds);
+
+            if (target.Handle != IntPtr.Zero)
+            {
+                ToggleSingleScreenBlackout(target);
+            }
+        }
     }
 }
+
 
