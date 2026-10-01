@@ -100,12 +100,18 @@ namespace Blackout
                 {
                     ChangeWindowMessageFilterEx(Handle, _wmBlackoutQuit, MSGFLT_ALLOW, IntPtr.Zero);
                 }
+                ChangeWindowMessageFilterEx(Handle, WM_TRAY_DRAG_INPUT, MSGFLT_ALLOW, IntPtr.Zero);
                 ChangeWindowMessageFilterEx(Handle, 0x0010 /* WM_CLOSE */, MSGFLT_ALLOW, IntPtr.Zero);
             }
 
             protected override void WndProc(ref Message m)
             {
-                if (_wmTaskbarCreated != 0 && m.Msg == _wmTaskbarCreated)
+                if (m.Msg == WM_TRAY_DRAG_INPUT)
+                {
+                    TrayDragEngine.OnInput((uint)m.WParam.ToInt64());
+                    return;
+                }
+                else if (_wmTaskbarCreated != 0 && m.Msg == _wmTaskbarCreated)
                 {
                     RebuildNotifyIcon();
                 }
@@ -180,7 +186,6 @@ namespace Blackout
 
         // 静态常驻 Win32 回调委托（严禁动态分配，防止被 .NET GC 回收引发 0xc0000005 原生崩溃）
         private static readonly LowLevelKeyboardProc _keyboardHookProc = HookCallback;
-        private static readonly LowLevelMouseProc _mouseHookProc = TrayDragMouseHookCallback;
         private static readonly WinEventDelegate _winEventProc = WinEventCallback;
         private static readonly EnumWindowsProc _enumWindowsProc = SuppressEnumWindowsProc;
         private static readonly MonitorEnumDelegate _monitorEnumProc = MonitorEnumCallback;
@@ -190,12 +195,8 @@ namespace Blackout
         private static int _isClosing;
         private static bool _isAllScreensBlackout;
 
-        // 托盘拖拽状态
-        private static bool _isTrayMouseDown;
-        private static Point _trayMouseDownPoint;
-        private static bool _trayDragExceeded;
+        // 托盘点击消抖时间戳
         private static long _suppressClickUntil;
-        private static IntPtr _mouseHookID = IntPtr.Zero;
 
         // 常量定义
         private const int WH_KEYBOARD_LL = 13;
@@ -203,9 +204,23 @@ namespace Blackout
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_SYSKEYDOWN = 0x0104;
         private const int WM_MOUSEMOVE = 0x0200;
+        private const int WM_LBUTTONDOWN = 0x0201;
         private const int WM_LBUTTONUP = 0x0202;
         private const int WM_DISPLAYCHANGE = 0x007E;
         private const int WM_DPICHANGED = 0x02E0;
+
+        private const int WM_APP = 0x8000;
+        private const int WM_TRAY_DRAG_INPUT = WM_APP + 110;
+        private const int SM_CXDRAG = 68;
+        private const int SM_CYDRAG = 69;
+        private const int GA_ROOT = 2;
+        private const int VK_ESCAPE = 0x1B;
+        private const int VK_LBUTTON = 0x01;
+        private const uint PM_NOREMOVE = 0x0000;
+        private const uint PM_REMOVE = 0x0001;
+        private const int WM_TIMER = 0x0113;
+        private const int WM_QUIT = 0x0012;
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
@@ -370,11 +385,182 @@ namespace Blackout
         [DllImport("user32.dll")]
         private static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr WindowFromPoint(PointStruct pt);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        [DllImport("shell32.dll", SetLastError = true)]
+        private static extern int Shell_NotifyIconGetRect(ref NOTIFYICONIDENTIFIER identifier, out Rect iconLocation);
+
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromRect(ref Rect lprc, uint dwFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref uint lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool PeekMessageW(out NativeMsg lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax, uint wRemoveMsg);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetMessageW(out NativeMsg lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+        [DllImport("user32.dll")]
+        private static extern bool TranslateMessage(ref NativeMsg lpMsg);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr DispatchMessageW(ref NativeMsg lpMsg);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PostThreadMessageW(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern UIntPtr SetTimer(IntPtr hWnd, UIntPtr nIDEvent, uint uElapse, IntPtr lpTimerFunc);
+
+        [DllImport("user32.dll")]
+        private static extern bool KillTimer(IntPtr hWnd, UIntPtr uIDEvent);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
         private delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         private delegate bool MonitorEnumDelegate(IntPtr hMonitor, IntPtr hdcMonitor, ref Rect lprcMonitor, IntPtr dwData);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeMsg
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public PointStruct pt;
+            public uint lPrivate;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NOTIFYICONIDENTIFIER
+        {
+            public uint cbSize;
+            public IntPtr hWnd;
+            public uint uID;
+            public Guid guidItem;
+        }
+
+        private struct TrayGesture
+        {
+            public uint Serial;
+            public long Started;
+            public long Released;
+            public Point Origin;
+            public Point Point;
+            public IntPtr Source;
+            public bool Pressed;
+            public bool Moved;
+            public bool Cancelled;
+        }
+
+        private sealed class TrayRegions
+        {
+            public Rect[] Rects = new Rect[256];
+            public int Count;
+            public bool Overflow;
+        }
+
+        private static bool IntersectRect(out Rect dst, ref Rect a, ref Rect b)
+        {
+            dst = new Rect
+            {
+                Left = Math.Max(a.Left, b.Left),
+                Top = Math.Max(a.Top, b.Top),
+                Right = Math.Min(a.Right, b.Right),
+                Bottom = Math.Min(a.Bottom, b.Bottom)
+            };
+            return dst.Left < dst.Right && dst.Top < dst.Bottom;
+        }
+
+        private static bool IsRectEmpty(ref Rect r)
+        {
+            return r.Left >= r.Right || r.Top >= r.Bottom;
+        }
+
+        private static bool GetNotifyIconIdentifier(out NOTIFYICONIDENTIFIER ident)
+        {
+            ident = default;
+            if (notifyIcon == null) return false;
+            try
+            {
+                var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+                var type = typeof(NotifyIcon);
+                var idField = type.GetField("_id", flags) ?? type.GetField("id", flags);
+                var winField = type.GetField("_window", flags) ?? type.GetField("window", flags);
+                if (idField == null || winField == null) return false;
+
+                object idVal = idField.GetValue(notifyIcon);
+                if (idVal == null) return false;
+                uint id = Convert.ToUInt32(idVal);
+
+                object winVal = winField.GetValue(notifyIcon);
+                if (winVal == null) return false;
+
+                IntPtr hwnd = IntPtr.Zero;
+                if (winVal is NativeWindow nw)
+                {
+                    hwnd = nw.Handle;
+                }
+                else
+                {
+                    var prop = winVal.GetType().GetProperty("Handle", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    if (prop != null)
+                    {
+                        hwnd = (IntPtr)prop.GetValue(winVal);
+                    }
+                }
+
+                if (hwnd == IntPtr.Zero) return false;
+
+                ident.cbSize = (uint)Marshal.SizeOf<NOTIFYICONIDENTIFIER>();
+                ident.hWnd = hwnd;
+                ident.uID = id;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct PointStruct
@@ -490,6 +676,7 @@ namespace Blackout
             trayMessageWindow = new TrayMessageWindow();
 
             InitializeNotifyIcon();
+            TrayDragEngine.Start(trayMessageWindow.Handle);
 
             RemoveLegacyRegistryAutoStart();
             if (!IsAutoStartDisabledByUser() && File.Exists(Application.ExecutablePath))
@@ -634,10 +821,12 @@ namespace Blackout
 
         private static void NotifyIcon_MouseUp(object sender, MouseEventArgs e)
         {
+            TrayDragEngine.SetIconCandidate(false);
             if (e.Button == MouseButtons.Left)
             {
-                if (Environment.TickCount64 < _suppressClickUntil)
+                if (Environment.TickCount64 < _suppressClickUntil || TrayDragEngine.IsDragActiveOrMoved())
                 {
+                    TrayDragEngine.ConfirmAndFinishIfPending();
                     return;
                 }
 
@@ -825,7 +1014,7 @@ namespace Blackout
         {
             try
             {
-                StopTrayDragHook();
+                TrayDragEngine.Stop();
             }
             catch
             {
@@ -1585,11 +1774,9 @@ namespace Blackout
 
                 if (vkCode == (int)Keys.Escape)
                 {
-                    if (_isTrayMouseDown)
+                    if (TrayDragEngine.IsDragging())
                     {
-                        _isTrayMouseDown = false;
-                        _trayDragExceeded = false;
-                        StopTrayDragHook();
+                        TrayDragEngine.Cancel();
                         return (IntPtr)1;
                     }
 
@@ -2114,97 +2301,566 @@ namespace Blackout
         {
             if (e.Button == MouseButtons.Left)
             {
-                _isTrayMouseDown = true;
-                _trayDragExceeded = false;
-                GetCursorPos(out PointStruct pt);
-                _trayMouseDownPoint = new Point(pt.X, pt.Y);
-                StartTrayDragHook();
+                TrayDragEngine.SetIconCandidate(true);
+                TrayDragEngine.ConfirmCurrentGesture();
             }
-        }
-
-        private static void StartTrayDragHook()
-        {
-            if (_mouseHookID == IntPtr.Zero)
-            {
-                using (Process curProcess = Process.GetCurrentProcess())
-                using (ProcessModule curModule = curProcess.MainModule)
-                {
-                    _mouseHookID = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc, GetModuleHandle(curModule.ModuleName), 0);
-                }
-            }
-        }
-
-        private static void StopTrayDragHook()
-        {
-            if (_mouseHookID != IntPtr.Zero)
-            {
-                UnhookWindowsHookEx(_mouseHookID);
-                _mouseHookID = IntPtr.Zero;
-            }
-        }
-
-        private static IntPtr TrayDragMouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0)
-            {
-                int msg = (int)wParam;
-                if (msg == WM_MOUSEMOVE)
-                {
-                    if (_isTrayMouseDown)
-                    {
-                        MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                        int dx = Math.Abs(hookStruct.pt.X - _trayMouseDownPoint.X);
-                        int dy = Math.Abs(hookStruct.pt.Y - _trayMouseDownPoint.Y);
-                        int dragThreshold = Math.Max(16, SystemInformation.DragSize.Width * 3);
-                        if (dx >= dragThreshold || dy >= dragThreshold)
-                        {
-                            _trayDragExceeded = true;
-                        }
-                    }
-                }
-                else if (msg == WM_LBUTTONUP)
-                {
-                    if (_isTrayMouseDown)
-                    {
-                        _isTrayMouseDown = false;
-                        MSLLHOOKSTRUCT hookStruct = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                        StopTrayDragHook();
-
-                        if (_trayDragExceeded)
-                        {
-                            _suppressClickUntil = Environment.TickCount64 + 400;
-                            Point dropPt = new Point(hookStruct.pt.X, hookStruct.pt.Y);
-                            int totalDist = Math.Abs(dropPt.X - _trayMouseDownPoint.X) + Math.Abs(dropPt.Y - _trayMouseDownPoint.Y);
-                            if (totalDist >= 35)
-                            {
-                                syncContext?.Post(_ => OnTrayDroppedOnScreen(dropPt), null);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        StopTrayDragHook();
-                    }
-                }
-            }
-            return CallNextHookEx(_mouseHookID, nCode, wParam, lParam);
         }
 
         private static void OnTrayDroppedOnScreen(Point dropPt)
         {
-            Screen screen = Screen.FromPoint(dropPt);
-            if (screen == null) return;
+            PointStruct ptStruct = new PointStruct { X = dropPt.X, Y = dropPt.Y };
+            IntPtr hMon = MonitorFromPoint(ptStruct, MONITOR_DEFAULTTONEAREST);
 
             enumeratedMonitors.Clear();
             EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
 
-            MonitorTarget target = enumeratedMonitors.Find(m =>
-                (!string.IsNullOrEmpty(m.DeviceName) && m.DeviceName == screen.DeviceName) ||
-                m.Bounds == screen.Bounds);
+            MonitorTarget target = default;
+            if (hMon != IntPtr.Zero)
+            {
+                target = enumeratedMonitors.Find(m => m.Handle == hMon);
+            }
+            if (target.Handle == IntPtr.Zero)
+            {
+                target = enumeratedMonitors.Find(m => m.Bounds.Contains(dropPt));
+            }
+            if (target.Handle == IntPtr.Zero)
+            {
+                Screen screen = Screen.FromPoint(dropPt);
+                if (screen != null)
+                {
+                    target = enumeratedMonitors.Find(m =>
+                        (!string.IsNullOrEmpty(m.DeviceName) && m.DeviceName == screen.DeviceName) ||
+                        m.Bounds == screen.Bounds);
+                }
+            }
 
             if (target.Handle != IntPtr.Zero)
             {
                 ToggleSingleScreenBlackout(target);
+            }
+        }
+
+        private static class TrayDragEngine
+        {
+            private static IntPtr _ownerHwnd;
+            private static Thread _inputThread;
+            private static uint _inputThreadId;
+            private static ManualResetEvent _readyEvent;
+            private static IntPtr _mouseHook;
+            private static IntPtr _keyHook;
+            private static UIntPtr _watchdogTimer;
+
+            private static readonly LowLevelMouseProc _mouseProc = DragMouseProc;
+            private static readonly LowLevelKeyboardProc _keyProc = DragKeyProc;
+
+            private static readonly object _lock = new object();
+            private static TrayGesture _gesture;
+            private static TrayGesture _previous;
+            private static uint _serial;
+            private static int _dx = 4;
+            private static int _dy = 4;
+            private static bool _initialized;
+            private static bool _available;
+
+            private static uint _assessed;
+            private static uint _confirmed;
+            private static uint _finished;
+            private static TrayRegions _initialRegions;
+            private static volatile bool _iconCandidate;
+
+            public static void Start(IntPtr owner)
+            {
+                if (_initialized) return;
+                _ownerHwnd = owner;
+                _dx = GetSystemMetrics(SM_CXDRAG);
+                if (_dx < 1) _dx = 4;
+                _dy = GetSystemMetrics(SM_CYDRAG);
+                if (_dy < 1) _dy = 4;
+
+                _readyEvent = new ManualResetEvent(false);
+                _inputThread = new Thread(InputThreadProc)
+                {
+                    IsBackground = true,
+                    Name = "Blackout_TrayDragInputThread"
+                };
+                _inputThread.SetApartmentState(ApartmentState.STA);
+                _inputThread.Start();
+
+                if (_readyEvent.WaitOne(3000) && _available)
+                {
+                    _initialized = true;
+                }
+                else
+                {
+                    Stop();
+                }
+            }
+
+            public static void Stop()
+            {
+                if (_inputThreadId != 0)
+                {
+                    PostThreadMessageW(_inputThreadId, (uint)WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+                    if (_inputThread != null && _inputThread.IsAlive)
+                    {
+                        _inputThread.Join(1000);
+                    }
+                    _inputThread = null;
+                    _inputThreadId = 0;
+                }
+
+                if (_readyEvent != null)
+                {
+                    _readyEvent.Dispose();
+                    _readyEvent = null;
+                }
+
+                _initialized = false;
+                _available = false;
+            }
+
+            private static void InputThreadProc()
+            {
+                _inputThreadId = GetCurrentThreadId();
+                PeekMessageW(out NativeMsg _, IntPtr.Zero, 0, 0, PM_NOREMOVE);
+
+                IntPtr hMod = IntPtr.Zero;
+                try
+                {
+                    using (Process curProcess = Process.GetCurrentProcess())
+                    using (ProcessModule curModule = curProcess.MainModule)
+                    {
+                        hMod = GetModuleHandle(curModule.ModuleName);
+                    }
+                }
+                catch { }
+
+                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hMod, 0);
+                _keyHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyProc, hMod, 0);
+                _available = (_mouseHook != IntPtr.Zero && _keyHook != IntPtr.Zero);
+
+                _readyEvent.Set();
+
+                if (!_available) return;
+
+                while (GetMessageW(out NativeMsg msg, IntPtr.Zero, 0, 0) > 0)
+                {
+                    if (msg.message == (uint)WM_TIMER)
+                    {
+                        OnWatchdogTick();
+                    }
+                    TranslateMessage(ref msg);
+                    DispatchMessageW(ref msg);
+                }
+
+                if (_watchdogTimer != UIntPtr.Zero)
+                {
+                    KillTimer(IntPtr.Zero, _watchdogTimer);
+                    _watchdogTimer = UIntPtr.Zero;
+                }
+
+                if (_mouseHook != IntPtr.Zero)
+                {
+                    UnhookWindowsHookEx(_mouseHook);
+                    _mouseHook = IntPtr.Zero;
+                }
+                if (_keyHook != IntPtr.Zero)
+                {
+                    UnhookWindowsHookEx(_keyHook);
+                    _keyHook = IntPtr.Zero;
+                }
+            }
+
+            private static void OnWatchdogTick()
+            {
+                TrayGesture gesture = Snapshot();
+                if (gesture.Pressed && ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0 ||
+                    Environment.TickCount64 - gesture.Started > 120000))
+                {
+                    lock (_lock)
+                    {
+                        _gesture.Cancelled = true;
+                        _gesture.Pressed = false;
+                        _gesture.Released = Environment.TickCount64;
+                    }
+                    PostMessageW(_ownerHwnd, WM_TRAY_DRAG_INPUT, (IntPtr)gesture.Serial, (IntPtr)WM_LBUTTONUP);
+                    if (_watchdogTimer != UIntPtr.Zero)
+                    {
+                        KillTimer(IntPtr.Zero, _watchdogTimer);
+                        _watchdogTimer = UIntPtr.Zero;
+                    }
+                }
+            }
+
+            private static IntPtr DragMouseProc(int nCode, IntPtr wParam, IntPtr lParam)
+            {
+                if (nCode >= 0)
+                {
+                    int message = (int)wParam;
+                    if (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP || message == WM_MOUSEMOVE)
+                    {
+                        MSLLHOOKSTRUCT input = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                        uint serial = 0;
+                        bool notify = false;
+
+                        lock (_lock)
+                        {
+                            if (message == WM_LBUTTONDOWN)
+                            {
+                                _serial++;
+                                if (_serial == 0) _serial = 1;
+                                _previous = _gesture;
+                                _gesture = new TrayGesture
+                                {
+                                    Serial = _serial,
+                                    Started = Environment.TickCount64,
+                                    Origin = new Point(input.pt.X, input.pt.Y),
+                                    Point = new Point(input.pt.X, input.pt.Y),
+                                    Source = WindowFromPoint(input.pt),
+                                    Pressed = true,
+                                    Moved = false,
+                                    Cancelled = false
+                                };
+                                notify = true;
+                            }
+                            else if (_gesture.Pressed)
+                            {
+                                _gesture.Point = new Point(input.pt.X, input.pt.Y);
+                                if (Math.Abs(input.pt.X - _gesture.Origin.X) >= _dx || Math.Abs(input.pt.Y - _gesture.Origin.Y) >= _dy)
+                                {
+                                    _gesture.Moved = true;
+                                }
+                                if (message == WM_LBUTTONUP)
+                                {
+                                    _gesture.Pressed = false;
+                                    _gesture.Released = Environment.TickCount64;
+                                    notify = true;
+                                }
+                            }
+                            serial = _gesture.Serial;
+                        }
+
+                        if (message == WM_LBUTTONDOWN && _watchdogTimer == UIntPtr.Zero)
+                        {
+                            _watchdogTimer = SetTimer(IntPtr.Zero, UIntPtr.Zero, 100, IntPtr.Zero);
+                        }
+                        if (message == WM_LBUTTONUP && _watchdogTimer != UIntPtr.Zero)
+                        {
+                            KillTimer(IntPtr.Zero, _watchdogTimer);
+                            _watchdogTimer = UIntPtr.Zero;
+                        }
+
+                        if (notify)
+                        {
+                            PostMessageW(_ownerHwnd, WM_TRAY_DRAG_INPUT, (IntPtr)serial, (IntPtr)message);
+                        }
+                    }
+                }
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+            }
+
+            private static IntPtr DragKeyProc(int nCode, IntPtr wParam, IntPtr lParam)
+            {
+                if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
+                {
+                    KBDLLHOOKSTRUCT kbd = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                    if (kbd.vkCode == VK_ESCAPE)
+                    {
+                        Cancel();
+                    }
+                }
+                return CallNextHookEx(_keyHook, nCode, wParam, lParam);
+            }
+
+            public static void Cancel()
+            {
+                lock (_lock)
+                {
+                    _gesture.Cancelled = true;
+                }
+            }
+
+            public static bool IsDragging()
+            {
+                lock (_lock)
+                {
+                    return _gesture.Pressed && _gesture.Moved;
+                }
+            }
+
+            public static bool IsDragActiveOrMoved()
+            {
+                lock (_lock)
+                {
+                    return _gesture.Moved || _gesture.Cancelled || (_confirmed == _gesture.Serial && _gesture.Moved);
+                }
+            }
+
+            private static TrayGesture Snapshot()
+            {
+                lock (_lock)
+                {
+                    return _gesture;
+                }
+            }
+
+            public static void ConfirmCurrentGesture()
+            {
+                TrayGesture current = Snapshot();
+                if (current.Serial != 0 && (current.Pressed || current.Moved))
+                {
+                    Confirm(current);
+                }
+            }
+
+            public static void ConfirmAndFinishIfPending()
+            {
+                TrayGesture current = Snapshot();
+                if (current.Serial != 0 && current.Moved && !current.Cancelled)
+                {
+                    Confirm(current);
+                    Finish(current);
+                }
+            }
+
+            private static void Confirm(TrayGesture gesture)
+            {
+                if (_confirmed == gesture.Serial) return;
+                _confirmed = gesture.Serial;
+                _initialRegions = new TrayRegions();
+                GetTrayRegions(_initialRegions);
+            }
+
+            public static void OnInput(uint serial)
+            {
+                if (!_available) return;
+                TrayGesture gesture = Snapshot();
+                if (serial != gesture.Serial) return;
+
+                if (_assessed != serial)
+                {
+                    _assessed = serial;
+                    if (gesture.Pressed && !gesture.Moved && !gesture.Cancelled)
+                    {
+                        if (IsNativeIconAt(gesture))
+                        {
+                            TrayGesture current = Snapshot();
+                            if (current.Serial == serial && current.Pressed && !current.Cancelled)
+                            {
+                                Confirm(current);
+                            }
+                        }
+                    }
+                }
+
+                Finish(gesture);
+            }
+
+            private static bool IsNativeIconAt(TrayGesture gesture)
+            {
+                if (!SourceIsTray(gesture.Source)) return false;
+
+                if (GetNotifyIconIdentifier(out NOTIFYICONIDENTIFIER identifier))
+                {
+                    IntPtr prevDpi = SetThreadDpiAwarenessContext((IntPtr)(-4));
+                    try
+                    {
+                        if (Shell_NotifyIconGetRect(ref identifier, out Rect rect) == 0)
+                        {
+                            if (gesture.Origin.X >= rect.Left - 2 && gesture.Origin.X <= rect.Right + 2 &&
+                                gesture.Origin.Y >= rect.Top - 2 && gesture.Origin.Y <= rect.Bottom + 2)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        if (prevDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(prevDpi);
+                    }
+                }
+
+                if (_iconCandidate)
+                {
+                    return true;
+                }
+
+                return false;
+            }
+
+            private static void Finish(TrayGesture gesture)
+            {
+                if (gesture.Pressed || _finished == gesture.Serial || _confirmed != gesture.Serial) return;
+                _finished = gesture.Serial;
+
+                if (!gesture.Moved || gesture.Cancelled || !IsWindow(gesture.Source))
+                {
+                    return;
+                }
+
+                TrayRegions current = new TrayRegions();
+                GetTrayRegions(current);
+
+                Point pt = gesture.Point;
+                if (InTrayRegions(current, pt) || InTrayRegions(_initialRegions, pt))
+                {
+                    return;
+                }
+
+                _suppressClickUntil = Environment.TickCount64 + 500;
+                syncContext?.Post(_ => OnTrayDroppedOnScreen(pt), null);
+            }
+
+            private static bool SourceIsTray(IntPtr source)
+            {
+                if (source == IntPtr.Zero) return false;
+                IntPtr root = GetAncestor(source, (uint)GA_ROOT);
+                if (root == IntPtr.Zero) root = source;
+                if (!IsWindowVisible(root)) return false;
+
+                StringBuilder sbRoot = new StringBuilder(256);
+                GetClassNameW(root, sbRoot, 256);
+                string rootCls = sbRoot.ToString();
+
+                if (rootCls == "Shell_TrayWnd" || rootCls == "Shell_SecondaryTrayWnd" ||
+                    rootCls == "NotifyIconOverflowWindow" || rootCls == "TopLevelWindowForOverflowXamlIsland")
+                {
+                    return true;
+                }
+
+                StringBuilder sbSource = new StringBuilder(256);
+                GetClassNameW(source, sbSource, 256);
+                string cls = sbSource.ToString();
+
+                if (cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd" ||
+                    cls == "NotifyIconOverflowWindow" || cls == "TopLevelWindowForOverflowXamlIsland")
+                {
+                    return true;
+                }
+
+                if (rootCls.StartsWith("DFTaskbar", StringComparison.OrdinalIgnoreCase) &&
+                    cls.StartsWith("DFTaskbarItem:TrayIcon", StringComparison.OrdinalIgnoreCase) &&
+                    IsDisplayFusionProcess(root))
+                {
+                    return true;
+                }
+
+                return false;
+            }
+
+            private static bool IsDisplayFusionProcess(IntPtr hWnd)
+            {
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid == 0) return false;
+                IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hProc == IntPtr.Zero) return false;
+                try
+                {
+                    StringBuilder sb = new StringBuilder(1024);
+                    uint size = (uint)sb.Capacity;
+                    if (QueryFullProcessImageNameW(hProc, 0, sb, ref size))
+                    {
+                        string path = sb.ToString();
+                        return path.EndsWith("DisplayFusion.exe", StringComparison.OrdinalIgnoreCase);
+                    }
+                }
+                finally
+                {
+                    CloseHandle(hProc);
+                }
+                return false;
+            }
+
+            private static void GetTrayRegions(TrayRegions regions)
+            {
+                regions.Rects = new Rect[256];
+                regions.Count = 0;
+                regions.Overflow = false;
+
+                IntPtr prevDpi = SetThreadDpiAwarenessContext((IntPtr)(-4));
+                try
+                {
+                    EnumWindows((hWnd, lParam) =>
+                    {
+                        if (!IsWindowVisible(hWnd)) return true;
+                        StringBuilder sb = new StringBuilder(256);
+                        GetClassNameW(hWnd, sb, 256);
+                        string cls = sb.ToString();
+
+                        bool df = cls.StartsWith("DFTaskbar", StringComparison.OrdinalIgnoreCase) && IsDisplayFusionProcess(hWnd);
+                        bool nativeRoot = cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd";
+                        bool overflowRoot = cls == "NotifyIconOverflowWindow" || cls == "TopLevelWindowForOverflowXamlIsland";
+
+                        if (!df && !nativeRoot && !overflowRoot) return true;
+                        if (!GetWindowRect(hWnd, out Rect barRect) || IsRectEmpty(ref barRect)) return true;
+                        if (MonitorFromRect(ref barRect, MONITOR_DEFAULTTONULL) == IntPtr.Zero) return true;
+
+                        if (overflowRoot)
+                        {
+                            AddRegion(regions, barRect);
+                            return true;
+                        }
+
+                        int first = regions.Count;
+                        EnumChildWindows(hWnd, (child, val) =>
+                        {
+                            if (!IsWindowVisible(child)) return true;
+                            StringBuilder childSb = new StringBuilder(256);
+                            GetClassNameW(child, childSb, 256);
+                            string childCls = childSb.ToString();
+
+                            bool match = df ? childCls.StartsWith("DFTaskbarItem:", StringComparison.OrdinalIgnoreCase)
+                                            : (childCls == "TrayNotifyWnd");
+                            if (!match) return true;
+
+                            if (GetWindowRect(child, out Rect childRect) && IntersectRect(out Rect clipped, ref childRect, ref barRect))
+                            {
+                                AddRegion(regions, clipped);
+                            }
+                            return true;
+                        }, IntPtr.Zero);
+
+                        if (regions.Count == first)
+                        {
+                            AddRegion(regions, barRect);
+                        }
+                        return true;
+                    }, IntPtr.Zero);
+                }
+                finally
+                {
+                    if (prevDpi != IntPtr.Zero) SetThreadDpiAwarenessContext(prevDpi);
+                }
+            }
+
+            private static void AddRegion(TrayRegions regions, Rect r)
+            {
+                if (IsRectEmpty(ref r)) return;
+                if (regions.Count >= 256)
+                {
+                    regions.Overflow = true;
+                    return;
+                }
+                regions.Rects[regions.Count++] = r;
+            }
+
+            private static bool InTrayRegions(TrayRegions regions, Point pt)
+            {
+                if (regions == null) return false;
+                if (regions.Overflow) return true;
+                for (int i = 0; i < regions.Count; i++)
+                {
+                    Rect r = regions.Rects[i];
+                    if (pt.X >= r.Left && pt.X <= r.Right && pt.Y >= r.Top && pt.Y <= r.Bottom)
+                        return true;
+                }
+                return false;
+            }
+
+            public static void SetIconCandidate(bool candidate)
+            {
+                _iconCandidate = candidate;
             }
         }
     }

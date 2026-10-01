@@ -17,6 +17,7 @@ obj/
 *.temp
 
 # Publish artifacts
+publish/
 *.pdb
 *.nupkg
 
